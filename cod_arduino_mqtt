@@ -1,0 +1,302 @@
+#include <FastLED.h>
+#include <PubSubClient.h>
+#include <WiFiClient.h>
+
+/** CONFIGURAÇÃO BÁSICA  **/
+
+// Configurações do MQTT (inserir valores correspondentes)
+const char* ssid = "Família Valencio";
+const char* password = "senha da rede";
+const char* mqttServer = "http://mqtt.org/";
+const int mqttPort = 1883;
+const char* mqttUser = "matheusoliveira.valencio@gmail.com";
+const char* mqttPassword = "senha do usuario";
+
+// Cliente MQTT
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// A quantidade de LEDs na configuração
+#define NUM_LEDS 150
+// O pino que controla os LEDs
+#define LED_PIN 6
+// O pino que le os valores do sensor
+#define ANALOG_READ 0
+
+// Valores confirmados do microfone: valor mínimo e máximo
+#define MIC_LOW 0.0
+#define MIC_HIGH 737.0
+
+// Outros macros
+// Quantos valores anteriores do sensor afetam a média de operação?
+#define AVGLEN 5
+// Quantos valores anteriores do sensor decidem se estamos em um pico/ALTO (por exemplo, em uma música)?
+#define LONG_SECTOR 20
+
+// Mnemônicos
+#define HIGH 3
+#define NORMAL 2
+
+// Quanto tempo mantemos o som médio "atual" antes de reiniciar a medição
+#define MSECS 30 * 1000
+#define CYCLES MSECS / DELAY
+
+/* Às vezes, as leituras estão erradas ou estranhas. Quanto um valor de leitura
+pode desviar da média para não ser descartado? **/
+#define DEV_THRESH 0.8
+
+// Atraso do loop do Arduino
+#define DELAY 1
+
+float fscale(float originalMin, float originalMax, float newBegin, float newEnd, float inputValue, float curve);
+void insert(int val, int *avgs, int len);
+int compute_average(int *avgs, int len);
+void visualize_music();
+void reconnect();
+
+// Quantidade de LEDs a serem exibidos
+int curshow = NUM_LEDS;
+
+// Modo de exibição
+int mode = 0;
+
+// Modo da música (NORMAL ou HIGH)
+int songmode = NORMAL;
+
+// Média do valor do som nas últimas CYCLES
+unsigned long song_avg;
+
+// Quantidade de iterações desde que song_avg foi reiniciado
+int iter = 0;
+
+// A velocidade com que os LEDs desbotam para o preto se não forem acesos novamente
+float fade_scale = 1.2;
+
+// Matriz de LEDs
+CRGB leds[NUM_LEDS];
+
+// Média curta do som usada para "normalizar" os valores de entrada
+int avgs[AVGLEN] = {-1};
+
+// Média longa do som
+int long_avg[LONG_SECTOR] = {-1};
+
+// Controle de quantas vezes e quanto tempo atingimos um determinado modo
+struct time_keeping {
+  unsigned long times_start;
+  short times;
+};
+
+// Quanto incrementar ou decrementar cada cor a cada ciclo
+struct color {
+  int r;
+  int g;
+  int b;
+};
+
+struct time_keeping high;
+struct color Color;
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Conexão WiFi
+  // ...
+
+  // Configuração dos LEDs
+  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
+  for (int i = 0; i < NUM_LEDS; i++)
+    leds[i] = CRGB::Black;
+  FastLED.show();
+
+  // Configuração do cliente MQTT
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
+  
+  // Conexão inicial MQTT
+  reconnect();
+}
+
+void loop() {
+  // Verificar conexão MQTT
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  int val = analogRead(ANALOG_READ);
+  insert(val, avgs, AVGLEN);
+
+  // Tons mais escuros são mais difíceis de ver em luzes normais.
+  int lightscale = 3;
+
+  // Se o som for alto por tempo suficiente, mudamos para o modo high
+  if (iter > LONG_SECTOR) {
+    // Queremos uma média do volume
+    song_avg = compute_average(long_avg, LONG_SECTOR);
+    if (song_avg >= ((MIC_HIGH - MIC_LOW) * 2 / 3) && songmode == NORMAL) {
+      Serial.println("HIGH!");
+      songmode = HIGH;
+      high.times_start = millis();
+      high.times = 0;
+      Color.r = 2 * lightscale;
+      Color.g = 4 * lightscale;
+      Color.b = 8 * lightscale;
+      Serial.println("HIGH");
+    } else if (song_avg < ((MIC_HIGH - MIC_LOW) * 2 / 3) && songmode == HIGH) {
+      Serial.println("NORMAL!");
+      songmode = NORMAL;
+      Color.r = 2 * lightscale;
+      Color.g = 4 * lightscale;
+      Color.b = 8 * lightscale;
+      Serial.println("NORMAL");
+    }
+
+    // Checar se já é tempo de mudar de volta
+    if (songmode == HIGH && millis() - high.times_start >= MSECS) {
+      high.times++;
+      Serial.print("Elapsed time: ");
+      Serial.println(millis() - high.times_start);
+      Serial.print("Times: ");
+      Serial.println(high.times);
+      if (high.times == 4) {
+        songmode = NORMAL;
+        Color.r = 2 * lightscale;
+        Color.g = 4 * lightscale;
+        Color.b = 8 * lightscale;
+        Serial.println("NORMAL");
+      } else {
+        high.times_start = millis();
+      }
+    }
+  }
+
+  // Se o som for alto, incrementamos as cores
+  if (songmode == HIGH) {
+    Color.r++;
+    Color.g++;
+    Color.b++;
+  } else {
+    // Se não, desbotamos as cores
+    Color.r = (int) (Color.r / fade_scale);
+    Color.g = (int) (Color.g / fade_scale);
+    Color.b = (int) (Color.b / fade_scale);
+  }
+
+  int disp = (int) fscale(MIC_LOW, MIC_HIGH, 0, curshow, (float) compute_average(avgs, AVGLEN), 2.0);
+  Serial.print("disp: ");
+  Serial.println(disp);
+
+  // Exibir os LEDs
+  visualize_music(disp);
+}
+
+float fscale(float originalMin, float originalMax, float newBegin, float newEnd, float inputValue, float curve) {
+  float OriginalRange = 0;
+  float NewRange = 0;
+  float zeroRefCurVal = 0;
+  float normalizedCurVal = 0;
+  float rangedValue = 0;
+  boolean invFlag = 0;
+
+  // parâmetro da curva da condição
+  // intervalo limite
+
+  if (curve > 10) curve = 10;
+  if (curve < -10) curve = -10;
+
+  curve = (curve * -.1) ; // - inverta e dimensione - isso parece mais intuitivo - números positivos dão mais peso ao resultado final
+  curve = pow(10, curve); // - converter escala linear em expoente logratímico para outra função pow
+
+  // Verifique se há inputValues ​​fora do intervalo
+  if (inputValue < originalMin) {
+    inputValue = originalMin;
+  }
+  if (inputValue > originalMax) {
+    inputValue = originalMax;
+  }
+
+  // Zero referencia os valores
+  OriginalRange = originalMax - originalMin;
+
+  if (newEnd > newBegin) {
+    NewRange = newEnd - newBegin;
+  } else {
+    NewRange = newBegin - newEnd;
+    invFlag = 1;
+  }
+
+  zeroRefCurVal = inputValue - originalMin;
+  normalizedCurVal  =  zeroRefCurVal / OriginalRange ;   // normalize to 0 - 1 float
+
+  // Verificar originalMin > originalMax
+  if (originalMin > originalMax ) {
+    return 0;
+  }
+
+  if (invFlag == 0) {
+    rangedValue =  (pow(normalizedCurVal, curve) * NewRange) + newBegin;
+
+  } else { // inverter os intervalos
+    rangedValue =  newBegin - (pow(normalizedCurVal, curve) * NewRange);
+  }
+
+  return rangedValue;
+}
+
+void insert(int val, int *avgs, int len) {
+  for (int i = 0; i < len - 1; i++) {
+    avgs[i] = avgs[i + 1];
+  }
+  avgs[len - 1] = val;
+}
+
+int compute_average(int *avgs, int len) {
+  int total = 0;
+  for (int i = 0; i < len; i++) {
+    total += avgs[i];
+  }
+  return total / len;
+}
+
+void visualize_music(int disp) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (i < disp) {
+      if (songmode == HIGH) {
+        leds[i] = CRGB(255 - Color.r, 255 - Color.g, 255 - Color.b);
+      } else {
+        leds[i] = CRGB(Color.r, Color.g, Color.b);
+      }
+    } else {
+      leds[i] = CRGB::Black;
+    }
+  }
+
+  FastLED.show();
+}
+
+void reconnect() {
+  // Loop até que estejamos conectados
+  while (!client.connected()) {
+    Serial.print("Conectando ao MQTT Broker...");
+    // Tentativa de conexão
+    if (client.connect("ESP8266Client", mqttUser, mqttPassword)) {
+      Serial.println("Conectado ao MQTT Broker!");
+      // Inscrever-se a um tópico
+      client.subscribe("leds/commands");
+    } else {
+      Serial.print("Falha na conexão. Tentando novamente em 5 segundos...");
+      delay(5000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Mensagem recebida no tópico: ");
+  Serial.println(topic);
+  Serial.print("Payload: ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
